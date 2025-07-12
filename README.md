@@ -16,8 +16,7 @@
 为了方便同学们获取照片，已将所有照片上传至百度网盘：
 
 **通过网盘分享的文件：曲阜师范大学2025年毕业典礼照片**
-- **链接**: https://pan.baidu.com/s/18FJpb3iPQ2c-vJLN-ol4Sg?pwd=2025
-- **提取码**: 2025
+- **链接**: https://pan.quark.cn/s/2ec9a69ab422
 
 ## 🚀 工具特性
 
@@ -298,7 +297,6 @@ python tests/quick_test.py
 
 如有问题或建议，欢迎通过以下方式联系：
 - 📧 邮箱: 通过GitHub Issues反馈
-- 💾 百度网盘: https://pan.baidu.com/s/18FJpb3iPQ2c-vJLN-ol4Sg?pwd=2025
 
 ---
 
