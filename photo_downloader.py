@@ -14,18 +14,31 @@ from pathlib import Path
 import hashlib
 import hmac
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue
 
 
 class PhotoDownloader:
-    def __init__(self, download_dir: str = "graduation_photos", debug: bool = False):
-        self.session = requests.Session()
+    def __init__(self, download_dir: str = "graduation_photos", debug: bool = False, max_workers: int = 8):
         self.download_dir = Path(download_dir)
         self.download_dir.mkdir(exist_ok=True)
         self.debug = debug
         self.access_token = None
+        self.max_workers = max_workers
 
-        # 设置请求头模拟浏览器
-        self.session.headers.update({
+        # 并发控制
+        self.download_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.stats = {
+            'total': 0,
+            'completed': 0,
+            'failed': 0,
+            'skipped': 0
+        }
+
+        # 基础请求头模板
+        self.base_headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Encoding': 'gzip, deflate, br, zstd',
@@ -37,10 +50,7 @@ class PhotoDownloader:
             'Sec-Fetch-Mode': 'cors',
             'Sec-Fetch-Site': 'same-site',
             'Origin': 'https://www.xxpie.com',
-        })
-
-        # 请求间隔（秒）- 避免对服务器造成压力
-        self.request_delay = 0.5
+        }
 
         # 图片质量选择
         self.quality_options = {
@@ -52,6 +62,12 @@ class PhotoDownloader:
             'large1920': 'url_large1920',      # 2560px
             'origin': 'url_origin'             # 原图
         }
+
+    def create_session(self) -> requests.Session:
+        """为每个线程创建独立的session"""
+        session = requests.Session()
+        session.headers.update(self.base_headers)
+        return session
 
     def debug_print(self, message: str):
         """调试输出"""
@@ -101,13 +117,14 @@ class PhotoDownloader:
     def get_album_page(self, album_url: str) -> Optional[str]:
         """获取相册页面内容"""
         try:
+            session = self.create_session()
             # 设置正确的referer
-            self.session.headers.update({
+            session.headers.update({
                 'Referer': album_url,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7'
             })
 
-            response = self.session.get(album_url)
+            response = session.get(album_url)
             response.raise_for_status()
             return response.text
         except requests.RequestException as e:
@@ -120,8 +137,10 @@ class PhotoDownloader:
         page_no = 1
         page_size = 60
 
+        session = self.create_session()
+
         # 设置API请求头
-        api_headers = self.session.headers.copy()
+        api_headers = session.headers.copy()
         api_headers.update({
             'Accept': 'application/json, text/plain, */*',
             'Referer': album_info['referer'],
@@ -154,7 +173,7 @@ class PhotoDownloader:
                 self.debug_print(f"请求API: {api_url}")
                 self.debug_print(f"参数: {params}")
 
-                response = self.session.get(api_url, params=params, headers=api_headers)
+                response = session.get(api_url, params=params, headers=api_headers)
                 response.raise_for_status()
 
                 data = response.json()
@@ -179,7 +198,7 @@ class PhotoDownloader:
                     break
 
                 page_no += 1
-                time.sleep(0.2)  # API请求间隔
+                time.sleep(0.1)  # API请求间隔
 
             except requests.RequestException as e:
                 print(f"API请求失败: {e}")
@@ -312,11 +331,22 @@ class PhotoDownloader:
         print(f"通过正则表达式找到 {len(unique_images)} 张图片")
         return unique_images
     
-    def download_image(self, image_url: str, filename: str, referer_url: str = None) -> bool:
-        """下载单张图片"""
+    def download_single_image(self, image_info: Dict, referer_url: str, thread_id: int) -> Dict:
+        """下载单张图片（线程安全版本）"""
+        result = {
+            'success': False,
+            'filename': image_info['name'],
+            'error': None,
+            'skipped': False,
+            'size': 0
+        }
+
         try:
-            # 设置下载请求头，模拟真实浏览器请求
-            headers = self.session.headers.copy()
+            # 为每个线程创建独立的session
+            session = self.create_session()
+
+            # 设置下载请求头
+            headers = session.headers.copy()
             headers.update({
                 'Referer': referer_url or 'https://www.xxpie.com/',
                 'Origin': 'https://www.xxpie.com',
@@ -326,19 +356,30 @@ class PhotoDownloader:
                 'Sec-Fetch-Site': 'same-site',
             })
 
-            print(f"正在下载: {filename}")
-            print(f"URL: {image_url[:100]}...")
+            # 清理文件名
+            safe_filename = re.sub(r'[<>:"/\\|?*]', '_', image_info['name'])
+            filepath = self.download_dir / safe_filename
 
-            response = self.session.get(image_url, headers=headers, stream=True, timeout=30)
+            # 检查文件是否已存在
+            if filepath.exists():
+                existing_size = filepath.stat().st_size
+                expected_size = image_info.get('size', 0)
+                if expected_size > 0 and existing_size == expected_size:
+                    result['skipped'] = True
+                    result['success'] = True
+                    result['size'] = existing_size
+                    return result
+
+            # 下载文件
+            response = session.get(image_info['url'], headers=headers, stream=True, timeout=30)
             response.raise_for_status()
 
-            # 检查响应内容类型
+            # 检查内容类型
             content_type = response.headers.get('content-type', '')
             if not content_type.startswith('image/'):
-                print(f"警告: 响应不是图片类型 ({content_type})")
+                result['error'] = f"响应不是图片类型: {content_type}"
+                return result
 
-            # 清理文件名，移除不安全字符
-            safe_filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
             # 确保文件有扩展名
             if '.' not in safe_filename:
                 if 'jpeg' in content_type or 'jpg' in content_type:
@@ -346,44 +387,59 @@ class PhotoDownloader:
                 elif 'png' in content_type:
                     safe_filename += '.png'
                 else:
-                    safe_filename += '.jpg'  # 默认扩展名
-
-            filepath = self.download_dir / safe_filename
-
-            # 如果文件已存在，检查大小
-            if filepath.exists():
-                existing_size = filepath.stat().st_size
-                expected_size = int(response.headers.get('content-length', 0))
-                if expected_size > 0 and existing_size == expected_size:
-                    print(f"跳过已存在的文件: {safe_filename}")
-                    return True
-                else:
-                    print(f"文件已存在但大小不匹配，重新下载: {safe_filename}")
+                    safe_filename += '.jpg'
+                filepath = self.download_dir / safe_filename
 
             # 写入文件
-            total_size = int(response.headers.get('content-length', 0))
             downloaded_size = 0
-
             with open(filepath, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
 
-                        # 显示进度
-                        if total_size > 0:
-                            progress = (downloaded_size / total_size) * 100
-                            print(f"\r进度: {progress:.1f}% ({downloaded_size}/{total_size} bytes)", end='', flush=True)
-
-            print(f"\n下载完成: {safe_filename} ({downloaded_size} bytes)")
-            return True
+            result['success'] = True
+            result['size'] = downloaded_size
+            result['filename'] = safe_filename
 
         except requests.RequestException as e:
-            print(f"\n下载失败 {filename}: {e}")
-            return False
+            result['error'] = f"网络错误: {e}"
         except IOError as e:
-            print(f"\n文件写入失败 {filename}: {e}")
-            return False
+            result['error'] = f"文件写入错误: {e}"
+        except Exception as e:
+            result['error'] = f"未知错误: {e}"
+
+        return result
+
+    def update_progress(self, result: Dict):
+        """更新下载进度（线程安全）"""
+        with self.progress_lock:
+            if result['success']:
+                if result['skipped']:
+                    self.stats['skipped'] += 1
+                else:
+                    self.stats['completed'] += 1
+            else:
+                self.stats['failed'] += 1
+
+            # 显示进度
+            total = self.stats['total']
+            completed = self.stats['completed']
+            failed = self.stats['failed']
+            skipped = self.stats['skipped']
+            processed = completed + failed + skipped
+
+            if result['success']:
+                status = "跳过" if result['skipped'] else "完成"
+                size_info = f" ({result['size']/1024/1024:.1f}MB)" if result['size'] > 0 else ""
+                print(f"[{processed}/{total}] {status}: {result['filename']}{size_info}")
+            else:
+                print(f"[{processed}/{total}] 失败: {result['filename']} - {result['error']}")
+
+            # 显示总体进度
+            if processed % 50 == 0 or processed == total:
+                progress_percent = (processed / total) * 100
+                print(f"\n📊 总进度: {progress_percent:.1f}% ({processed}/{total}) - 成功:{completed}, 跳过:{skipped}, 失败:{failed}\n")
     
     def choose_quality(self) -> str:
         """选择图片质量"""
@@ -513,59 +569,123 @@ class PhotoDownloader:
 
 
     def batch_download(self, image_list: List[Dict], referer_url: str) -> int:
-        """批量下载图片"""
-        success_count = 0
+        """并发批量下载图片"""
+        self.stats['total'] = len(image_list)
+        self.stats['completed'] = 0
+        self.stats['failed'] = 0
+        self.stats['skipped'] = 0
+
         failed_list = []
 
-        print(f"\n开始批量下载 {len(image_list)} 张图片...")
+        print(f"\n🚀 开始并发下载 {len(image_list)} 张图片...")
+        print(f"📊 并发线程数: {self.max_workers}")
+        print(f"{'='*60}")
 
-        for i, image_info in enumerate(image_list, 1):
-            print(f"\n[{i}/{len(image_list)}] 下载: {image_info['name']}")
+        start_time = time.time()
 
-            if self.download_image(image_info['url'], image_info['name'], referer_url):
-                success_count += 1
-            else:
-                failed_list.append(image_info)
+        # 使用线程池进行并发下载
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 提交所有下载任务
+            future_to_image = {
+                executor.submit(self.download_single_image, image_info, referer_url, i): image_info
+                for i, image_info in enumerate(image_list)
+            }
 
-            # 请求间隔
-            if i < len(image_list):
-                time.sleep(self.request_delay)
+            # 处理完成的任务
+            for future in as_completed(future_to_image):
+                image_info = future_to_image[future]
+                try:
+                    result = future.result()
+                    self.update_progress(result)
 
-        print(f"\n{'='*50}")
-        print(f"下载完成！成功下载 {success_count}/{len(image_list)} 张图片")
+                    if not result['success']:
+                        failed_list.append(image_info)
 
+                except Exception as e:
+                    print(f"任务执行异常: {image_info['name']} - {e}")
+                    failed_list.append(image_info)
+                    with self.progress_lock:
+                        self.stats['failed'] += 1
+
+        end_time = time.time()
+        duration = end_time - start_time
+
+        # 显示最终统计
+        print(f"\n{'='*60}")
+        print(f"📊 下载完成统计:")
+        print(f"   总数量: {self.stats['total']}")
+        print(f"   成功: {self.stats['completed']}")
+        print(f"   跳过: {self.stats['skipped']}")
+        print(f"   失败: {self.stats['failed']}")
+        print(f"   耗时: {duration:.1f}秒")
+
+        if self.stats['completed'] > 0:
+            avg_speed = self.stats['completed'] / duration
+            print(f"   平均速度: {avg_speed:.1f}张/秒")
+
+        # 处理失败的图片
         if failed_list:
-            print(f"\n失败的图片 ({len(failed_list)} 张):")
-            for img in failed_list:
-                print(f"  - {img['name']}")
+            print(f"\n❌ 失败的图片 ({len(failed_list)} 张):")
+            for img in failed_list[:10]:  # 只显示前10个
+                print(f"   - {img['name']}")
+            if len(failed_list) > 10:
+                print(f"   ... 还有 {len(failed_list) - 10} 张")
 
-            # 询问是否重试失败的图片
-            retry = input("\n是否重试失败的图片？(y/N): ").strip().lower()
+            # 询问是否重试
+            retry = input(f"\n是否重试失败的 {len(failed_list)} 张图片？(y/N): ").strip().lower()
             if retry == 'y':
-                print("\n开始重试失败的图片...")
-                retry_success = 0
-                for i, image_info in enumerate(failed_list, 1):
-                    print(f"\n[重试 {i}/{len(failed_list)}] {image_info['name']}")
-                    if self.download_image(image_info['url'], image_info['name'], referer_url):
-                        retry_success += 1
-                        success_count += 1
-                    time.sleep(self.request_delay)
-
+                print(f"\n🔄 开始重试失败的图片...")
+                retry_success = self.retry_failed_downloads(failed_list, referer_url)
                 print(f"\n重试完成！重试成功 {retry_success}/{len(failed_list)} 张图片")
-                print(f"总计成功下载 {success_count}/{len(image_list)} 张图片")
+                return self.stats['completed'] + retry_success
 
-        return success_count
+        return self.stats['completed']
+
+    def retry_failed_downloads(self, failed_list: List[Dict], referer_url: str) -> int:
+        """重试失败的下载（使用较少的并发数）"""
+        retry_workers = min(4, self.max_workers)  # 重试时使用较少的线程
+        retry_success = 0
+
+        print(f"使用 {retry_workers} 个线程重试...")
+
+        with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+            future_to_image = {
+                executor.submit(self.download_single_image, image_info, referer_url, i): image_info
+                for i, image_info in enumerate(failed_list)
+            }
+
+            for future in as_completed(future_to_image):
+                image_info = future_to_image[future]
+                try:
+                    result = future.result()
+                    if result['success']:
+                        retry_success += 1
+                        status = "跳过" if result['skipped'] else "完成"
+                        print(f"重试{status}: {result['filename']}")
+                    else:
+                        print(f"重试失败: {result['filename']} - {result['error']}")
+                except Exception as e:
+                    print(f"重试异常: {image_info['name']} - {e}")
+
+        return retry_success
 
 
 def main():
     """主函数"""
-    print("毕业典礼照片批量下载工具 v3.0 (API版本)")
+    print("毕业典礼照片批量下载工具 v4.0 (并发版本)")
     print("=" * 60)
-    print("✨ 新功能:")
-    print("• 使用官方API获取照片列表，更稳定可靠")
+    print("🚀 v4.0 新功能:")
+    print("• 多线程并发下载，速度大幅提升")
+    print("• 智能进度显示和统计信息")
+    print("• 线程安全的文件处理")
+    print("• 失败重试机制")
+    print("• 支持大量图片的高效下载")
+    print("=" * 60)
+    print("📋 继承功能:")
+    print("• 使用官方API获取照片列表")
     print("• 支持多种图片质量选择")
     print("• 显示文件大小和分辨率信息")
-    print("• 改进的错误处理和重试机制")
+    print("• 改进的错误处理机制")
     print("=" * 60)
     print("注意事项：")
     print("1. 请确保已获得学校或照片提供方的合法授权")
@@ -613,9 +733,32 @@ def main():
 
     print(f"下载目录: {download_dir}")
 
+    # 设置并发数
+    print(f"\n⚙️  并发设置:")
+    print(f"推荐并发数:")
+    print(f"• 网络较慢: 4-8 线程")
+    print(f"• 网络一般: 8-16 线程")
+    print(f"• 网络较快: 16-32 线程")
+
+    while True:
+        max_workers_input = input(f"请输入并发线程数 (默认: 8): ").strip()
+        if not max_workers_input:
+            max_workers = 8
+            break
+        try:
+            max_workers = int(max_workers_input)
+            if 1 <= max_workers <= 50:
+                break
+            else:
+                print("并发数应在1-50之间")
+        except ValueError:
+            print("请输入有效的数字")
+
+    print(f"并发线程数: {max_workers}")
+
     try:
         # 创建下载器
-        downloader = PhotoDownloader(download_dir, debug=False)
+        downloader = PhotoDownloader(download_dir, debug=False, max_workers=max_workers)
 
         # 选择图片质量
         quality = downloader.choose_quality()
